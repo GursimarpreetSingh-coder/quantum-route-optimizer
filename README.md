@@ -37,8 +37,7 @@ npm start
 ```
 
 ### Access the Application
-- Frontend: http://localhost:3000
-- API: http://localhost:5000
+- App and API: http://localhost:3002
 
 ## 🏗️ Architecture
 

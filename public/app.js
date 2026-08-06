@@ -459,6 +459,7 @@ class QuantumLogisticsApp {
                 <p><strong>Route:</strong> ${result.baseline.route.join(' → ')}</p>
                 <p><strong>Total Time:</strong> ${result.baseline.total_time.toFixed(2)} minutes</p>
                 <p><strong>On-Time Deliveries:</strong> ${result.baseline.on_time_deliveries.toFixed(1)}%</p>
+                <p><strong>Late Minutes:</strong> ${(result.baseline.late_minutes || 0).toFixed(2)}</p>
             </div>
             
             <div class="route-info">
@@ -466,6 +467,7 @@ class QuantumLogisticsApp {
                 <p><strong>Route:</strong> ${result.optimized.route.join(' → ')}</p>
                 <p><strong>Total Time:</strong> ${result.optimized.total_time.toFixed(2)} minutes</p>
                 <p><strong>On-Time Deliveries:</strong> ${result.optimized.on_time_deliveries.toFixed(1)}%</p>
+                <p><strong>Late Minutes:</strong> ${(result.optimized.late_minutes || 0).toFixed(2)}</p>
                 <p><strong>Solver:</strong> ${result.optimized.solver_type}</p>
                 <p><strong>Solve Time:</strong> ${result.optimized.solve_time.toFixed(3)} seconds</p>
             </div>

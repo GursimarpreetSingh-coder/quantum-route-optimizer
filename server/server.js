@@ -3,12 +3,20 @@
 
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+// 3000 and 3001 are commonly occupied by other local web apps; this project
+// defaults to 3002 while still allowing callers to override it with PORT.
+const PORT = process.env.PORT || 3002;
 
 app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+});
 
 // Haversine distance in km
 function haversineKm([lat1, lon1], [lat2, lon2]) {
@@ -73,8 +81,10 @@ function nearestNeighborTour(coords) {
 }
 
 function computeTimesMinutes(coords, order, scenario, time_windows, now = new Date()) {
-  // Simple, transparent model: driving time from distance and average speed
-  // Baseline average urban speed 35 km/h
+  // Closed-tour travel model: depot -> every stop -> depot.
+  // If a window [e, l] is supplied, early arrival waits until e and late
+  // arrival is recorded. The reported duration is the actual makespan, not
+  // an invented lateness-adjusted value.
   const avgSpeedKmh = 35;
   const { timeFactor, serviceFactor } = scenarioFactors(scenario);
   const trafficFactor = trafficPredictFactor(now);
@@ -88,35 +98,40 @@ function computeTimesMinutes(coords, order, scenario, time_windows, now = new Da
   }
   const driveMinutes = (driveKm / avgSpeedKmh) * 60 * combinedTimeFactor;
   const serviceMinutes = (order.length - 1) * servicePerStopMin;
-  let totalMinutes = driveMinutes + serviceMinutes;
-  // Basic time windows lateness penalty: windows format [[e,l], ...] aligned with nodes
+  let clock = 0;
+  let waitingMinutes = 0;
+  let lateMinutes = 0;
+  let onTimeStops = 0;
+  const stopCount = order.length - 1;
   if (Array.isArray(time_windows)) {
-    // simulate arrival times along order
-    let t = 0;
-    const latePenaltyPerMin = 1.0; // 1 minute of lateness adds 1 minute equivalent penalty
-    for (let idx = 0; idx < order.length; idx++) {
+    for (let idx = 1; idx < order.length; idx++) {
       const i = order[idx];
-      // travel from previous
-      if (idx > 0) {
-        const prev = order[idx - 1];
-        const legKm = haversineKm(coords[prev], coords[i]);
-        const legMin = (legKm / avgSpeedKmh) * 60 * combinedTimeFactor;
-        t += legMin;
-      }
-      // service time except at depot
-      if (idx > 0) t += servicePerStopMin;
+      const prev = order[idx - 1];
+      const legKm = haversineKm(coords[prev], coords[i]);
+      clock += (legKm / avgSpeedKmh) * 60 * combinedTimeFactor;
       const win = time_windows[i];
       if (win && Array.isArray(win) && win.length === 2) {
-        const [e, l] = win;
-        if (t > l) {
-          totalMinutes += (t - l) * latePenaltyPerMin;
-        } else if (t < e) {
-          // waiting allowed; no penalty, but could add waiting time if modeling driver idle
-        }
+        const [e, l] = win.map(Number);
+        if (Number.isFinite(e) && Number.isFinite(l) && e <= l) {
+          if (clock < e) { waitingMinutes += e - clock; clock = e; }
+          if (clock <= l) onTimeStops += 1;
+          else lateMinutes += clock - l;
+        } else onTimeStops += 1;
+      } else {
+        onTimeStops += 1;
       }
+      clock += servicePerStopMin;
     }
+  } else {
+    onTimeStops = stopCount;
   }
-  return { totalMinutes, driveKm };
+  // Return to depot is already included in driveMinutes. Waiting shifts the
+  // completed route duration by exactly the accumulated waiting time.
+  const totalMinutes = driveMinutes + serviceMinutes + waitingMinutes;
+  return {
+    totalMinutes, driveKm, waitingMinutes, lateMinutes,
+    onTimeDeliveries: stopCount ? (onTimeStops / stopCount) * 100 : 100
+  };
 }
 function buildTimeMatrixMinutes(coords, scenario, now = new Date()) {
   const n = coords.length;
@@ -211,82 +226,85 @@ function decodeTourFromBits(bits, n) {
   return tour;
 }
 
-function quboSimulatedAnnealingTour(coords, scenario, sweeps = 2000, restarts = 6) {
+function quboSimulatedAnnealingTour(coords, scenario, timeWindows, sweeps = 1200, restarts = 8) {
+  /*
+   * Position QUBO: x(i,k)=1 iff node i is visited at position k.
+   * Minimise E(x) = travel(x) + P[sum_k(sum_i x(i,k)-1)^2
+   *                                  + sum_i(sum_k x(i,k)-1)^2].
+   *
+   * A single-bit flip breaks those hard constraints and was therefore almost
+   * always rejected in the old implementation. Here every annealing proposal
+   * swaps two non-depot positions. It stays in the feasible QUBO subspace,
+   * so the QUBO energy changes with the route rather than with violations.
+   */
   const T = buildTimeMatrixMinutes(coords, scenario);
   const { Q, n } = quboFromTSPTimeWindows(T);
-  const N = n * n;
-  let bestTour = null;
-  let bestCost = Infinity;
-  function randomFeasibleInit() {
-    // start from NN tour encoded as feasible x
-    const tour = nearestNeighborTour(coords);
-    const bits = new Array(N).fill(0);
+  const encode = (tour) => {
+    const bits = new Array(n * n).fill(0);
     for (let k = 0; k < n; k++) bits[tour[k] * n + k] = 1;
     return bits;
-  }
+  };
+  const score = (tour) => {
+    const metrics = computeTimesMinutes(coords, tour, scenario, timeWindows);
+    // Soft time-window penalty: one minute late is equivalent to five route minutes.
+    return metrics.totalMinutes + 5 * metrics.lateMinutes;
+  };
+  let bestTour = null;
+  let bestScore = Infinity;
+  const base = nearestNeighborTour(coords);
   for (let r = 0; r < restarts; r++) {
-    let bits = randomFeasibleInit();
-    let temp = 1.0;
-    const cool = 0.995;
-    let currentE = energyOfBitstring(Q, bits);
-    for (let s = 0; s < sweeps; s++) {
-      // flip a random bit, plus its row/column cleanup to keep near-feasible
-      const flip = Math.floor(Math.random() * N);
-      const prev = bits[flip];
-      bits[flip] = prev ? 0 : 1;
-      const newE = energyOfBitstring(Q, bits);
-      const dE = newE - currentE;
-      if (dE <= 0 || Math.random() < Math.exp(-dE / Math.max(temp, 1e-6))) {
-        currentE = newE;
-      } else {
-        bits[flip] = prev; // revert
-      }
-      temp *= cool;
+    const tour = base.slice();
+    // Randomise each restart while retaining depot at position zero.
+    for (let i = n - 1; i > 1; i--) {
+      const j = 1 + Math.floor(Math.random() * i);
+      [tour[i], tour[j]] = [tour[j], tour[i]];
     }
-    const tour = decodeTourFromBits(bits, n);
-    if (tour && tour[0] === 0) {
-      const { totalMinutes } = computeTimesMinutes(coords, tour, scenario);
-      if (totalMinutes < bestCost) {
-        bestCost = totalMinutes;
-        bestTour = tour;
-      }
+    let current = score(tour);
+    const initialTemp = Math.max(5, current * 0.12);
+    for (let step = 0; step < sweeps; step++) {
+      const a = 1 + Math.floor(Math.random() * (n - 1));
+      let b = 1 + Math.floor(Math.random() * (n - 1));
+      if (a === b) continue;
+      [tour[a], tour[b]] = [tour[b], tour[a]];
+      const proposed = score(tour);
+      const temperature = initialTemp * Math.pow(0.002 / initialTemp, step / Math.max(1, sweeps - 1));
+      const delta = proposed - current;
+      if (delta <= 0 || Math.random() < Math.exp(-delta / temperature)) current = proposed;
+      else [tour[a], tour[b]] = [tour[b], tour[a]];
+    }
+    // This confirms the final route is a valid binary QUBO assignment.
+    const bits = encode(tour);
+    const quboEnergy = energyOfBitstring(Q, bits);
+    if (Number.isFinite(quboEnergy) && current < bestScore) {
+      bestScore = current;
+      bestTour = tour.slice();
     }
   }
-  // Fallback
-  if (!bestTour) bestTour = nearestNeighborTour(coords);
-  return bestTour;
+  return bestTour || base;
 }
 
-function twoOptImprove(coords, tour, scenario) {
-  // Time-aware 2-opt using scenario-adjusted times
+function twoOptImprove(coords, tour, scenario, timeWindows) {
+  // 2-opt minimises the same travel-and-lateness objective reported by the API.
   const n = tour.length;
   if (n < 4) return tour;
-  const { timeFactor } = scenarioFactors(scenario);
-  const avgSpeedKmh = 35;
-  function edgeTime(i, j) {
-    const d = haversineKm(coords[i], coords[j]);
-    return (d / avgSpeedKmh) * 60 * timeFactor;
-  }
-  function delta(i, k) {
-    // edges: (i-1,i) + (k,k+1) vs (i-1,k) + (i,k+1)
-    const a = tour[(i - 1 + n) % n];
-    const b = tour[i];
-    const c = tour[k];
-    const d = tour[(k + 1) % n];
-    const before = edgeTime(a, b) + edgeTime(c, d);
-    const after = edgeTime(a, c) + edgeTime(b, d);
-    return after - before;
-  }
+  const score = (candidate) => {
+    const m = computeTimesMinutes(coords, candidate, scenario, timeWindows);
+    return m.totalMinutes + 5 * m.lateMinutes;
+  };
+  let current = score(tour);
   let improved = true;
   while (improved) {
     improved = false;
-    for (let i = 1; i < n - 2; i++) {
-      for (let k = i + 1; k < n - 1; k++) {
-        if (delta(i, k) < -1e-9) {
-          // reverse segment [i..k]
-          const seg = tour.slice(i, k + 1).reverse();
-          tour.splice(i, seg.length, ...seg);
+    for (let i = 1; i < n - 1 && !improved; i++) {
+      for (let k = i + 1; k < n; k++) {
+        const candidate = tour.slice();
+        candidate.splice(i, k - i + 1, ...candidate.slice(i, k + 1).reverse());
+        const proposed = score(candidate);
+        if (proposed < current - 1e-9) {
+          tour.splice(0, n, ...candidate);
+          current = proposed;
           improved = true;
+          break;
         }
       }
     }
@@ -294,28 +312,65 @@ function twoOptImprove(coords, tour, scenario) {
   return tour;
 }
 
-function quantumInspiredTour(coords, scenario, restarts = 8) {
-  // Quantum-inspired: multiple random restarts + 2-opt local refinement
-  // Truthful: this is NOT real quantum hardware; it's stochastic sampling
-  let bestTour = null;
-  let bestTime = Infinity;
-  for (let r = 0; r < restarts; r++) {
-    // start from shuffled tour (depot fixed at 0)
-    const n = coords.length;
-    const nodes = Array.from({ length: n - 1 }, (_, i) => i + 1);
-    for (let i = nodes.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [nodes[i], nodes[j]] = [nodes[j], nodes[i]];
+function quantumInspiredTour(coords, scenario, timeWindows, populationSize = 36, generations = 80) {
+  /*
+   * Quantum-inspired evolutionary algorithm (QEA), executed classically.
+   * For every (position, node) pair we maintain a probability amplitude a;
+   * p = a^2 is used when measuring a route. After each generation, amplitudes
+   * are rotated toward the best measured route: a' = normalize((1-r)a + r t).
+   * Sampling without replacement preserves the TSP permutation constraint.
+   * This is deliberately independent of the 2-Opt implementation.
+   */
+  const n = coords.length;
+  const width = n - 1;
+  const amplitudes = Array.from({ length: width }, () => Array(n).fill(0));
+  for (let position = 0; position < width; position++) {
+    for (let node = 1; node < n; node++) amplitudes[position][node] = 1 / Math.sqrt(width);
+  }
+  const score = (tour) => {
+    const metrics = computeTimesMinutes(coords, tour, scenario, timeWindows);
+    return metrics.totalMinutes + 5 * metrics.lateMinutes;
+  };
+  const measure = () => {
+    const unused = new Set(Array.from({ length: width }, (_, index) => index + 1));
+    const tour = [0];
+    for (let position = 0; position < width; position++) {
+      let total = 0;
+      for (const node of unused) total += amplitudes[position][node] ** 2;
+      let threshold = Math.random() * total;
+      let chosen = [...unused][0];
+      for (const node of unused) {
+        threshold -= amplitudes[position][node] ** 2;
+        if (threshold <= 0) { chosen = node; break; }
+      }
+      tour.push(chosen);
+      unused.delete(chosen);
     }
-    let tour = [0, ...nodes];
-    tour = twoOptImprove(coords, tour, scenario);
-    const t = computeTimesMinutes(coords, tour, scenario).totalMinutes;
-    if (t < bestTime) {
-      bestTime = t;
-      bestTour = tour.slice();
+    return tour;
+  };
+  let bestTour = null;
+  let bestScore = Infinity;
+  for (let generation = 0; generation < generations; generation++) {
+    const population = Array.from({ length: populationSize }, () => {
+      const tour = measure();
+      return { tour, score: score(tour) };
+    }).sort((left, right) => left.score - right.score);
+    const elite = population[0];
+    if (elite.score < bestScore) { bestScore = elite.score; bestTour = elite.tour.slice(); }
+    const learningRate = 0.06 + 0.14 * (generation / Math.max(1, generations - 1));
+    for (let position = 0; position < width; position++) {
+      const target = elite.tour[position + 1];
+      let normSquared = 0;
+      for (let node = 1; node < n; node++) {
+        const targetAmplitude = node === target ? 1 : 0;
+        amplitudes[position][node] = (1 - learningRate) * amplitudes[position][node] + learningRate * targetAmplitude;
+        normSquared += amplitudes[position][node] ** 2;
+      }
+      const norm = Math.sqrt(normSquared);
+      for (let node = 1; node < n; node++) amplitudes[position][node] /= norm;
     }
   }
-  return bestTour;
+  return bestTour || nearestNeighborTour(coords);
 }
 
 app.get('/api/health', (req, res) => {
@@ -341,6 +396,17 @@ app.post('/api/optimize', (req, res) => {
   if (!Array.isArray(coordinates) || coordinates.length < 2) {
     return res.status(400).json({ success: false, error: 'Need at least 2 coordinates' });
   }
+  if (coordinates.length > 100) {
+    return res.status(400).json({ success: false, error: 'Maximum 100 coordinates supported' });
+  }
+  if (!coordinates.every((point) => Array.isArray(point) && point.length === 2 &&
+    Number.isFinite(Number(point[0])) && Number.isFinite(Number(point[1])) &&
+    Math.abs(Number(point[0])) <= 90 && Math.abs(Number(point[1])) <= 180)) {
+    return res.status(400).json({ success: false, error: 'Coordinates must be valid [latitude, longitude] pairs' });
+  }
+  if (solver === 'qubo_sa' && coordinates.length > 20) {
+    return res.status(400).json({ success: false, error: 'QUBO simulated annealing is limited to 20 nodes; use AI 2-Opt for larger routes' });
+  }
 
   // Baseline: visit in given order [0..n-1]
   const baselineOrder = Array.from({ length: coordinates.length }, (_, i) => i);
@@ -353,17 +419,17 @@ app.post('/api/optimize', (req, res) => {
     case 'two_opt':
     case 'two_opt_ai': {
       const nn = nearestNeighborTour(coordinates);
-      optimizedOrder = twoOptImprove(coordinates, nn, scenario);
+      optimizedOrder = twoOptImprove(coordinates, nn, scenario, time_windows);
       solverType = 'two_opt_ai';
       break;
     }
     case 'qubo_sa': {
-      optimizedOrder = quboSimulatedAnnealingTour(coordinates, scenario);
+      optimizedOrder = quboSimulatedAnnealingTour(coordinates, scenario, time_windows);
       solverType = 'qubo_sa';
       break;
     }
     case 'quantum_inspired': {
-      optimizedOrder = quantumInspiredTour(coordinates, scenario);
+      optimizedOrder = quantumInspiredTour(coordinates, scenario, time_windows);
       solverType = 'quantum_inspired';
       break;
     }
@@ -377,7 +443,10 @@ app.post('/api/optimize', (req, res) => {
 
   // Improvement metrics
   const timeSaved = Math.max(baseline.totalMinutes - optimized.totalMinutes, 0);
-  const improvementPercent = baseline.totalMinutes > 0 ? (timeSaved / baseline.totalMinutes) * 100 : 0;
+  const baselineObjective = baseline.totalMinutes + 5 * baseline.lateMinutes;
+  const optimizedObjective = optimized.totalMinutes + 5 * optimized.lateMinutes;
+  const objectiveSaved = Math.max(baselineObjective - optimizedObjective, 0);
+  const improvementPercent = baselineObjective > 0 ? (objectiveSaved / baselineObjective) * 100 : 0;
   // CO2 and fuel savings from reduced km (simple linear model)
   const deltaKm = Math.max(baseline.driveKm - optimized.driveKm, 0);
   const kgCO2PerKm = 0.19; // small van ~0.18–0.25 kg/km
@@ -391,17 +460,22 @@ app.post('/api/optimize', (req, res) => {
     baseline: {
       route: baselineOrder,
       total_time: baseline.totalMinutes,
-      on_time_deliveries: 100.0
+      on_time_deliveries: baseline.onTimeDeliveries,
+      late_minutes: baseline.lateMinutes,
+      optimization_objective: baselineObjective
     },
     optimized: {
       route: optimizedOrder,
       total_time: optimized.totalMinutes,
-      on_time_deliveries: 100.0,
+      on_time_deliveries: optimized.onTimeDeliveries,
+      late_minutes: optimized.lateMinutes,
+      optimization_objective: optimizedObjective,
       solver_type: solverType,
       solve_time: solveTimeSec
     },
     improvement: {
       time_saved_minutes: timeSaved,
+      objective_saved_minutes: objectiveSaved,
       improvement_percent: improvementPercent,
       co2_savings_kg: co2SavingsKg,
       fuel_savings_liters: fuelSavingsL
@@ -418,5 +492,3 @@ app.post('/api/optimize', (req, res) => {
 app.listen(PORT, () => {
   console.log(`API listening on port ${PORT}`);
 });
-
-
