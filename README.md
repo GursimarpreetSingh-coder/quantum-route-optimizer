@@ -4,6 +4,12 @@
 
 An intelligent route optimization system that combines AI traffic forecasting with quantum-inspired optimization to solve last-mile logistics challenges in India.
 
+# Quantum AI Logistics Engine
+
+🚀 **Live Demo:** https://quantum-route-optimizer-final.onrender.com
+
+📂 **Source Code:** https://github.com/GursimarpreetSingh-coder/quantum-route-optimizer
+
 ## 🎯 Problem Statement
 
 India faces massive challenges in last-mile logistics, especially for time-sensitive and critical supplies like medicines, vaccines, food, and emergency aid. Current routing systems struggle with:
