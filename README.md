@@ -16,7 +16,7 @@ An intelligent route optimization system that combines AI traffic forecasting wi
 Explore the interface and key features of Quantum Route Optimizer.
 
 ### 🗺️ Route Optimization Dashboard
-![Quantum Route Optimizer Dashboard](screenshotOP.png)
+![Quantum Route Optimizer Dashboard](screenshotsOP.png)
 
 
 
