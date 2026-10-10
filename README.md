@@ -10,6 +10,17 @@ An intelligent route optimization system that combines AI traffic forecasting wi
 
 📂 **Source Code:** https://github.com/GursimarpreetSingh-coder/quantum-route-optimizer
 
+
+## 📸 Screenshots
+
+Explore the interface and key features of Quantum Route Optimizer.
+
+### 🗺️ Route Optimization Dashboard
+![Quantum Route Optimizer Dashboard](screenshotOP.png)
+
+
+
+
 ## 🎯 Problem Statement
 
 India faces massive challenges in last-mile logistics, especially for time-sensitive and critical supplies like medicines, vaccines, food, and emergency aid. Current routing systems struggle with:
